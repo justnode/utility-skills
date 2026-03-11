@@ -16,10 +16,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
-from dotenv import load_dotenv
 from groq import Groq
 
 # ---------------------------------------------------------------------------
@@ -43,6 +43,10 @@ DEFAULT_CHUNK_MINUTES = 10
 DEFAULT_MODEL = "whisper-large-v3"
 DEFAULT_FORMAT = "md"
 DEFAULT_GRANULARITY = "segment"
+
+# API retry settings
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -142,22 +146,46 @@ def transcribe_audio(
     model: str,
     language: str | None,
     granularity: str,
+    prompt: str | None = None,
 ) -> dict:
-    """Transcribe a single audio file via Groq API and return the raw response."""
-    with open(audio_path, "rb") as f:
-        response = client.audio.transcriptions.create(
-            file=f,
-            model=model,
-            response_format="verbose_json",
-            timestamp_granularities=[granularity],
-            language=language if language else None,  # None lets Whisper auto-detect
-            temperature=0.0,
-        )
+    """Transcribe a single audio file via Groq API and return the raw response.
 
-    # The SDK returns a Pydantic model; convert to dict for uniform handling
-    if hasattr(response, "model_dump"):
-        return response.model_dump()
-    return json.loads(json.dumps(response, default=str))
+    Retries up to MAX_RETRIES times on transient API errors.
+    """
+    kwargs: dict = {
+        "model": model,
+        "response_format": "verbose_json",
+        "timestamp_granularities": [granularity],
+        "temperature": 0.0,
+    }
+    if language:
+        kwargs["language"] = language
+    if prompt:
+        kwargs["prompt"] = prompt
+
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            with open(audio_path, "rb") as f:
+                kwargs["file"] = f
+                response = client.audio.transcriptions.create(**kwargs)
+
+            # The SDK returns a Pydantic model; convert to dict for uniform handling
+            if hasattr(response, "model_dump"):
+                return response.model_dump()
+            return json.loads(json.dumps(response, default=str))
+        except Exception as e:
+            last_error = e
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY_SECONDS * attempt
+                print(f"  ⚠ API error (attempt {attempt}/{MAX_RETRIES}): {e}")
+                print(f"    Retrying in {delay}s …")
+                time.sleep(delay)
+            else:
+                break
+
+    print(f"  ✗ API failed after {MAX_RETRIES} attempts: {last_error}", file=sys.stderr)
+    raise last_error
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +202,7 @@ def process_file(
     chunk_minutes: int,
     ffmpeg_path: str,
     ffprobe_path: str,
+    prompt: str | None = None,
 ) -> list[dict]:
     """
     Process an input file: extract audio if needed, chunk if large, transcribe.
@@ -201,7 +230,7 @@ def process_file(
         if file_size <= MAX_FILE_SIZE_BYTES:
             print(f"  File size: {file_size / 1024 / 1024:.1f} MB (within limit, no chunking needed)")
             print(f"  Transcribing …")
-            result = transcribe_audio(client, prepared_audio, model, language, granularity)
+            result = transcribe_audio(client, prepared_audio, model, language, granularity, prompt)
             return _extract_segments(result, granularity, offset=0.0)
         else:
             print(f"  File size: {file_size / 1024 / 1024:.1f} MB (exceeds {MAX_FILE_SIZE_BYTES / 1024 / 1024:.0f} MB limit)")
@@ -223,7 +252,7 @@ def process_file(
                 print(f"  Chunk {i + 1}/{num_chunks}: {_fmt_seconds(start)} – {_fmt_seconds(start + actual_duration)}")
                 extract_audio(prepared_audio, chunk_path, ffmpeg_path, start_seconds=start, duration_seconds=actual_duration)
 
-                result = transcribe_audio(client, chunk_path, model, language, granularity)
+                result = transcribe_audio(client, chunk_path, model, language, granularity, prompt)
                 segments = _extract_segments(result, granularity, offset=start)
                 all_segments.extend(segments)
 
@@ -329,6 +358,60 @@ def format_txt(segments: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _fmt_srt_time(seconds: float) -> str:
+    """Format seconds into SRT timestamp: HH:MM:SS,mmm."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def _fmt_vtt_time(seconds: float) -> str:
+    """Format seconds into VTT timestamp: HH:MM:SS.mmm."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int((seconds - int(seconds)) * 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def format_srt(segments: list[dict]) -> str:
+    """Format transcription segments as SRT subtitle file."""
+    lines = []
+    idx = 1
+    for seg in segments:
+        text = seg["text"]
+        if not text:
+            continue
+        start = _fmt_srt_time(seg["start"])
+        end = _fmt_srt_time(seg["end"])
+        lines.append(str(idx))
+        lines.append(f"{start} --> {end}")
+        lines.append(text)
+        lines.append("")
+        idx += 1
+    return "\n".join(lines)
+
+
+def format_vtt(segments: list[dict]) -> str:
+    """Format transcription segments as WebVTT subtitle file."""
+    lines = ["WEBVTT", ""]
+    idx = 1
+    for seg in segments:
+        text = seg["text"]
+        if not text:
+            continue
+        start = _fmt_vtt_time(seg["start"])
+        end = _fmt_vtt_time(seg["end"])
+        lines.append(str(idx))
+        lines.append(f"{start} --> {end}")
+        lines.append(text)
+        lines.append("")
+        idx += 1
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
@@ -348,7 +431,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-f", "--format",
-        choices=["md", "txt"],
+        choices=["md", "txt", "srt", "vtt"],
         default=DEFAULT_FORMAT,
         help=f"Output format (default: {DEFAULT_FORMAT})",
     )
@@ -369,6 +452,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Whisper model name (default: {DEFAULT_MODEL})",
     )
     parser.add_argument(
+        "-p", "--prompt",
+        default=None,
+        help="Prompt hint for Whisper (e.g. proper nouns, technical terms) to improve accuracy",
+    )
+    parser.add_argument(
         "--chunk-minutes",
         type=int,
         default=DEFAULT_CHUNK_MINUTES,
@@ -381,24 +469,13 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # Load .env from the skill directory (parent of scripts/)
-    skill_dir = Path(__file__).resolve().parent.parent
-    env_path = skill_dir / ".env"
-    if env_path.exists():
-        load_dotenv(env_path)
-    else:
-        print(
-            f"Warning: .env file not found at {env_path}. "
-            f"Copy .env.example to .env and set your GROQ_API_KEY.",
-            file=sys.stderr,
-        )
-
-    # Validate API key
+    # Validate API key from environment
     api_key = os.environ.get("GROQ_API_KEY")
     if not api_key or api_key == "your_groq_api_key_here":
         print(
-            "Error: GROQ_API_KEY is not set or is still the placeholder value.\n"
-            f"Please set it in {env_path} or as an environment variable.",
+            "Error: GROQ_API_KEY environment variable is not set.\n"
+            "Please set it: export GROQ_API_KEY=your_key_here\n"
+            "Get a key from: https://console.groq.com/keys",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -420,11 +497,12 @@ def main() -> None:
         sys.exit(1)
 
     # Resolve output path
+    format_ext_map = {"md": ".md", "txt": ".txt", "srt": ".srt", "vtt": ".vtt"}
     if args.output:
         output_path = os.path.abspath(args.output)
     else:
         stem = Path(input_path).stem
-        out_ext = ".md" if args.format == "md" else ".txt"
+        out_ext = format_ext_map[args.format]
         output_path = str(Path(input_path).parent / f"{stem}_transcript{out_ext}")
 
     # Initialize tools
@@ -444,6 +522,8 @@ def main() -> None:
     print(f"  Language:    {args.language or 'auto-detect'}")
     print(f"  Granularity: {args.granularity}")
     print(f"  Format:      {args.format}")
+    if args.prompt:
+        print(f"  Prompt:      {args.prompt}")
     print(f"  Output:      {output_path}")
     print()
 
@@ -457,6 +537,7 @@ def main() -> None:
         chunk_minutes=args.chunk_minutes,
         ffmpeg_path=ffmpeg_path,
         ffprobe_path=ffprobe_path,
+        prompt=args.prompt,
     )
 
     if not segments:
@@ -464,10 +545,13 @@ def main() -> None:
         sys.exit(1)
 
     # Format output
-    if args.format == "md":
-        output_content = format_markdown(segments, input_path, args.model, args.language)
-    else:
-        output_content = format_txt(segments)
+    formatters = {
+        "md": lambda: format_markdown(segments, input_path, args.model, args.language),
+        "txt": lambda: format_txt(segments),
+        "srt": lambda: format_srt(segments),
+        "vtt": lambda: format_vtt(segments),
+    }
+    output_content = formatters[args.format]()
 
     # Write output
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)

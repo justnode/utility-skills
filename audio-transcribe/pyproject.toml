@@ -5,7 +5,6 @@ description = "Transcribe video/audio files to timestamped text using Groq Whisp
 requires-python = ">=3.10"
 dependencies = [
     "groq>=0.18.0",
-    "python-dotenv>=1.0.0",
     "static-ffmpeg>=2.7",
 ]
 
