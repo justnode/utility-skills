@@ -1,11 +1,18 @@
 [project]
 name = "audio-transcribe"
-version = "1.0.0"
-description = "Transcribe video/audio files to timestamped text using Groq Whisper API"
+version = "2.0.0"
+description = "Transcribe video/audio files to timestamped text (Groq API or faster-whisper local)"
 requires-python = ">=3.10"
 dependencies = [
     "groq>=0.18.0",
     "static-ffmpeg>=2.7",
+]
+
+[project.optional-dependencies]
+local = [
+    "faster-whisper>=1.1.0",
+    "nvidia-cublas-cu12>=12.4",
+    "nvidia-cudnn-cu12>=9.0,<10",
 ]
 
 [build-system]

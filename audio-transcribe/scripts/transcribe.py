@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Audio/Video Transcription Script using Groq Whisper API.
+Audio/Video Transcription Script.
 
 Transcribes video or audio files to timestamped text.
+- Backend: Groq Whisper API (online) or faster-whisper (local/offline).
 - Automatically extracts audio from video files using ffmpeg.
-- Supports large file chunking (>25MB) with configurable chunk duration.
-- Outputs in Markdown or TXT format with timestamps.
+- Supports large file chunking with configurable chunk duration.
+- Outputs in Markdown, TXT, SRT, or VTT format with timestamps.
 """
 
 import argparse
@@ -20,7 +21,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from groq import Groq
+# groq and faster_whisper are imported lazily based on --backend
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -44,9 +45,13 @@ DEFAULT_MODEL = "whisper-large-v3"
 DEFAULT_FORMAT = "md"
 DEFAULT_GRANULARITY = "segment"
 
-# API retry settings
+# API retry settings (groq backend)
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
+
+# Backend defaults
+DEFAULT_BACKEND = "groq"
+DEFAULT_COMPUTE_TYPE = "float16"
 
 
 # ---------------------------------------------------------------------------
@@ -136,12 +141,12 @@ def extract_audio(
 
 
 # ---------------------------------------------------------------------------
-# Groq transcription
+# Transcription backends
 # ---------------------------------------------------------------------------
 
 
-def transcribe_audio(
-    client: Groq,
+def transcribe_groq(
+    client,
     audio_path: str,
     model: str,
     language: str | None,
@@ -188,6 +193,56 @@ def transcribe_audio(
     raise last_error
 
 
+def transcribe_local(
+    fw_model,
+    audio_path: str,
+    language: str | None,
+    granularity: str,
+    prompt: str | None = None,
+) -> dict:
+    """Transcribe a single audio file via faster-whisper locally.
+
+    Returns a dict matching Groq's verbose_json structure for uniform handling.
+    """
+    kwargs: dict = {
+        "beam_size": 5,
+        "word_timestamps": granularity == "word",
+        "vad_filter": True,
+        "temperature": 0.0,
+    }
+    if language:
+        kwargs["language"] = language
+    if prompt:
+        kwargs["initial_prompt"] = prompt
+
+    segments_gen, info = fw_model.transcribe(audio_path, **kwargs)
+    segments_list = list(segments_gen)
+
+    # Build a dict compatible with Groq's verbose_json response
+    result: dict = {
+        "text": " ".join(seg.text.strip() for seg in segments_list),
+        "language": info.language,
+        "segments": [],
+        "words": [],
+    }
+
+    for seg in segments_list:
+        result["segments"].append({
+            "start": seg.start,
+            "end": seg.end,
+            "text": seg.text.strip(),
+        })
+        if seg.words:
+            for w in seg.words:
+                result["words"].append({
+                    "start": w.start,
+                    "end": w.end,
+                    "word": w.word.strip(),
+                })
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Chunking logic
 # ---------------------------------------------------------------------------
@@ -195,17 +250,20 @@ def transcribe_audio(
 
 def process_file(
     input_path: str,
-    client: Groq,
-    model: str,
-    language: str | None,
+    transcribe_fn,
     granularity: str,
     chunk_minutes: int,
     ffmpeg_path: str,
     ffprobe_path: str,
-    prompt: str | None = None,
+    need_chunking: bool = True,
 ) -> list[dict]:
     """
     Process an input file: extract audio if needed, chunk if large, transcribe.
+
+    Args:
+        transcribe_fn: Callable(audio_path) -> dict  (Groq-style verbose_json dict)
+        need_chunking: If True, chunk files exceeding 25MB (required for Groq).
+                       If False, process as a single file (local backend handles any size).
 
     Returns a list of segment dicts with keys: start, end, text.
     """
@@ -227,10 +285,10 @@ def process_file(
         file_size = os.path.getsize(prepared_audio)
 
         # Step 2: Decide whether to chunk
-        if file_size <= MAX_FILE_SIZE_BYTES:
-            print(f"  File size: {file_size / 1024 / 1024:.1f} MB (within limit, no chunking needed)")
+        if not need_chunking or file_size <= MAX_FILE_SIZE_BYTES:
+            print(f"  File size: {file_size / 1024 / 1024:.1f} MB")
             print(f"  Transcribing …")
-            result = transcribe_audio(client, prepared_audio, model, language, granularity, prompt)
+            result = transcribe_fn(prepared_audio)
             return _extract_segments(result, granularity, offset=0.0)
         else:
             print(f"  File size: {file_size / 1024 / 1024:.1f} MB (exceeds {MAX_FILE_SIZE_BYTES / 1024 / 1024:.0f} MB limit)")
@@ -252,7 +310,7 @@ def process_file(
                 print(f"  Chunk {i + 1}/{num_chunks}: {_fmt_seconds(start)} – {_fmt_seconds(start + actual_duration)}")
                 extract_audio(prepared_audio, chunk_path, ffmpeg_path, start_seconds=start, duration_seconds=actual_duration)
 
-                result = transcribe_audio(client, chunk_path, model, language, granularity, prompt)
+                result = transcribe_fn(chunk_path)
                 segments = _extract_segments(result, granularity, offset=start)
                 all_segments.extend(segments)
 
@@ -419,7 +477,8 @@ def format_vtt(segments: list[dict]) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Transcribe video/audio files to timestamped text using Groq Whisper API.",
+        description="Transcribe video/audio files to timestamped text. "
+                    "Supports Groq Whisper API (online) and faster-whisper (local/offline).",
     )
     parser.add_argument(
         "input",
@@ -462,23 +521,39 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CHUNK_MINUTES,
         help=f"Minutes per chunk for large files (default: {DEFAULT_CHUNK_MINUTES})",
     )
+    parser.add_argument(
+        "-b", "--backend",
+        choices=["groq", "local"],
+        default=DEFAULT_BACKEND,
+        help=f"Transcription backend (default: {DEFAULT_BACKEND})",
+    )
+    parser.add_argument(
+        "--compute-type",
+        default=DEFAULT_COMPUTE_TYPE,
+        help=f"Compute type for local backend: 'float16', 'float32', 'int8_float16' (default: {DEFAULT_COMPUTE_TYPE})",
+    )
     return parser
+
+
+def _setup_cuda_lib_path() -> None:
+    """Ensure LD_LIBRARY_PATH includes nvidia-cublas and nvidia-cudnn installed by pip/uv."""
+    try:
+        import nvidia.cublas.lib
+        import nvidia.cudnn.lib
+        cublas_dir = os.path.dirname(nvidia.cublas.lib.__file__)
+        cudnn_dir = os.path.dirname(nvidia.cudnn.lib.__file__)
+        existing = os.environ.get("LD_LIBRARY_PATH", "")
+        paths = [cublas_dir, cudnn_dir]
+        if existing:
+            paths.append(existing)
+        os.environ["LD_LIBRARY_PATH"] = ":".join(paths)
+    except ImportError:
+        pass  # Libraries might be installed system-wide
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-
-    # Validate API key from environment
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key or api_key == "your_groq_api_key_here":
-        print(
-            "Error: GROQ_API_KEY environment variable is not set.\n"
-            "Please set it: export GROQ_API_KEY=your_key_here\n"
-            "Get a key from: https://console.groq.com/keys",
-            file=sys.stderr,
-        )
-        sys.exit(1)
 
     # Validate input file
     input_path = os.path.abspath(args.input)
@@ -505,20 +580,64 @@ def main() -> None:
         out_ext = format_ext_map[args.format]
         output_path = str(Path(input_path).parent / f"{stem}_transcript{out_ext}")
 
-    # Initialize tools
+    # Initialize ffmpeg tools
     ffmpeg_path = _get_ffmpeg_path()
     ffprobe_path = _get_ffprobe_path()
-    client = Groq(api_key=api_key)
 
     is_video = input_ext in VIDEO_EXTENSIONS
     file_type = "video" if is_video else "audio"
+
+    # Initialize backend
+    if args.backend == "groq":
+        from groq import Groq
+
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key or api_key == "your_groq_api_key_here":
+            print(
+                "Error: GROQ_API_KEY environment variable is not set.\n"
+                "Please set it: export GROQ_API_KEY=your_key_here\n"
+                "Get a key from: https://console.groq.com/keys",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        client = Groq(api_key=api_key)
+
+        def transcribe_fn(audio_path: str) -> dict:
+            return transcribe_groq(client, audio_path, args.model, args.language, args.granularity, args.prompt)
+
+        need_chunking = True
+        backend_display = f"groq ({args.model})"
+
+    else:  # local (GPU only, CUDA 12.x)
+        _setup_cuda_lib_path()
+
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError:
+            print(
+                "Error: faster-whisper is not installed.\n"
+                "Install it: uv sync --project <SKILL_DIR> --extra local",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        compute_type = args.compute_type
+        print(f"  Loading model '{args.model}' on cuda ({compute_type}) …")
+        fw_model = WhisperModel(args.model, device="cuda", compute_type=compute_type)
+
+        def transcribe_fn(audio_path: str) -> dict:
+            return transcribe_local(fw_model, audio_path, args.language, args.granularity, args.prompt)
+
+        need_chunking = False
+        backend_display = f"local ({args.model}, cuda, {compute_type})"
 
     print(f"╔══════════════════════════════════════════════════╗")
     print(f"║          Audio Transcription Tool                ║")
     print(f"╚══════════════════════════════════════════════════╝")
     print(f"  Input:       {input_path}")
     print(f"  Type:        {file_type}")
-    print(f"  Model:       {args.model}")
+    print(f"  Backend:     {backend_display}")
     print(f"  Language:    {args.language or 'auto-detect'}")
     print(f"  Granularity: {args.granularity}")
     print(f"  Format:      {args.format}")
@@ -530,14 +649,12 @@ def main() -> None:
     # Process file
     segments = process_file(
         input_path=input_path,
-        client=client,
-        model=args.model,
-        language=args.language,
+        transcribe_fn=transcribe_fn,
         granularity=args.granularity,
         chunk_minutes=args.chunk_minutes,
         ffmpeg_path=ffmpeg_path,
         ffprobe_path=ffprobe_path,
-        prompt=args.prompt,
+        need_chunking=need_chunking,
     )
 
     if not segments:
