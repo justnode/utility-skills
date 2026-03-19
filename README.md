@@ -5,6 +5,9 @@ A curated collection of practical AI-powered utility skills designed for everyda
 ## 🚀 Features
 
 - **Audio Transcribe** - Convert video/audio files to timestamped text with online (Groq) and offline (Whisper) options
+- **Image Generate** - Generate images using Replicate API models (nano-banana-2, seedream-4.5)
+- **Exa Plus** - Neural web search for people, companies, news, research, and code
+- **Tavily Search** - AI-optimized web search with clean, relevant results
 - **Mind Map Generator** - (Coming soon) Generate visual mind maps from text and ideas
 - More practical skills coming soon...
 
