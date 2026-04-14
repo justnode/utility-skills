@@ -332,7 +332,7 @@ uv run --extra local python scripts/transcribe.py /path/to/test.mp3 \
 
 ```
 usage: transcribe.py [-h] [-o OUTPUT] [-f {md,txt,srt,vtt}]
-                     [-l LANGUAGE] [-g {segment,word}] [-m MODEL] [-p PROMPT]
+                     [-l LANGUAGE] [-g {auto,segment,word}] [-m MODEL] [-p PROMPT]
                      [--chunk-minutes CHUNK_MINUTES]
                      [-b {groq,openrouter,local}]
                      [--compute-type COMPUTE_TYPE]
@@ -344,7 +344,7 @@ usage: transcribe.py [-h] [-o OUTPUT] [-f {md,txt,srt,vtt}]
   -f, --format         输出格式：txt（默认）、md、srt、vtt
   -l, --language       语言代码：zh、en、ja 等（默认：自动检测）
   -g, --granularity    时间戳粒度：auto（默认）、segment（段落）、word（单词级）
-  -m, --model          模型名称（groq 默认：whisper-large-v3；openrouter 默认：google/gemini-2.5-flash；离线常用：large-v3、base、small、medium）
+  -m, --model          模型名称（若设置了 AUDIO_TRANSCRIBE_DEFAULT_MODEL，则优先使用该值；否则使用所选 backend 的默认模型：groq=whisper-large-v3，openrouter=google/gemini-2.5-flash；离线常用：large-v3、base、small、medium）
   -p, --prompt         提示词，帮助识别专业术语、人名等
   --chunk-minutes      大文件分片时长，默认 10 分钟（仅云端模式）
   -b, --backend        后端：groq（云端默认）、openrouter（Gemini ASR）、local（离线 GPU）
