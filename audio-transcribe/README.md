@@ -1,17 +1,19 @@
 # Audio Transcribe
 
-音视频转录工具，支持云端（Groq Whisper API）和离线（本地 NVIDIA GPU）两种转录模式。
+音视频转录工具，支持云端（Groq Whisper API / OpenRouter Gemini 2.5 Flash）和离线（本地 NVIDIA GPU）两类转录模式。
 
 ## 功能特性
 
 - 🎬 支持常见视频格式：mp4, mkv, avi, mov, wmv, flv, webm 等
 - 🎵 支持常见音频格式：mp3, wav, flac, m4a, ogg, aac 等
-- 🤖 **云端模式**：调用 Groq Whisper API，适合快速接入
+- 🤖 **云端模式**：支持 Groq Whisper API 和 OpenRouter Gemini 2.5 Flash
 - 💻 **离线模式**：本地 NVIDIA GPU 运行 faster-whisper，适合不上传音频内容的场景
-- 📝 输出格式：Markdown、TXT、SRT、VTT
+- 📝 输出格式：Markdown、连续纯文本 TXT、SRT、VTT
 - 🌍 支持自动语言检测和手动指定语言
 - 🧠 支持 `--prompt` 提升专业术语识别准确率
-- ✂️ Groq 云端模式下，大于 25MB 的音频会自动分片
+- ✂️ 云端模式下，大于 25MB 的预处理音频会自动分片
+- ⏱️ OpenRouter Gemini ASR 当前只支持段级时间戳，不支持 `word` 粒度
+- 🧩 字幕默认使用 `--granularity auto`：OpenRouter 走段级时间，Groq Whisper / 本地 faster-whisper 优先用词级时间再合并成自然字幕句子
 
 ---
 
@@ -19,18 +21,51 @@
 
 ### 云端模式必需
 
+优先从全局配置文件读取：
+
+`~/.utility-skills/.env`
+
+```dotenv
+AUDIO_TRANSCRIBE_DEFAULT_BACKEND=groq
+AUDIO_TRANSCRIBE_DEFAULT_MODEL=whisper-large-v3
+# 可选：如果只使用一个云服务商，可配置通用 key
+# AUDIO_TRANSCRIBE_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxx
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxx
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxxxxxxxxxxxxxx
+# 可选
+# OPENROUTER_BASE_URL=https://openrouter.ai/api/v1/chat/completions
+# OPENROUTER_HTTP_REFERER=https://your-app.example.com
+# OPENROUTER_APP_TITLE=Your App Name
+```
+
+也可以继续使用当前 shell 的环境变量，且 shell 环境变量优先级更高：
+
 ```bash
 # Linux/macOS
 export GROQ_API_KEY="gsk_xxxxxxxxxxxxxxxxxxxxxxxx"
+export OPENROUTER_API_KEY="sk-or-xxxxxxxxxxxxxxxxxxxxxxxx"
 
 # Windows (CMD)
 set GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxx
+set OPENROUTER_API_KEY=sk-or-xxxxxxxxxxxxxxxxxxxxxxxx
 
 # Windows (PowerShell)
 $env:GROQ_API_KEY="gsk_xxxxxxxxxxxxxxxxxxxxxxxx"
+$env:OPENROUTER_API_KEY="sk-or-xxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
-获取 API Key：[https://console.groq.com/keys](https://console.groq.com/keys)
+获取 API Key：
+
+- Groq: [https://console.groq.com/keys](https://console.groq.com/keys)
+- OpenRouter: [https://openrouter.ai/settings/keys](https://openrouter.ai/settings/keys)
+
+配置优先级：
+
+- `AUDIO_TRANSCRIBE_DEFAULT_BACKEND` 控制不传 `--backend` 时默认使用哪个 provider
+- `AUDIO_TRANSCRIBE_DEFAULT_MODEL` 控制不传 `--model` 时的默认模型
+- API key 优先使用 provider 专属变量：`GROQ_API_KEY` / `OPENROUTER_API_KEY`
+- 如果 provider 专属变量没配，则回退到通用 `AUDIO_TRANSCRIBE_API_KEY`
 
 ### 离线模式
 
@@ -62,14 +97,20 @@ uv sync --extra local
 ### 2. 基本使用
 
 ```bash
-# 云端转录（默认）
+# 云端转录（默认值可由 .env 配置；未配置时是 Groq + whisper-large-v3，输出 TXT 正文）
 uv run python scripts/transcribe.py /path/to/video.mp4
+
+# OpenRouter Gemini 2.5 Flash 转录
+uv run python scripts/transcribe.py /path/to/video.mp4 --backend openrouter
 
 # 离线 GPU 转录
 uv run --extra local python scripts/transcribe.py /path/to/video.mp4 --backend local
 
 # 生成中文字幕文件
 uv run python scripts/transcribe.py /path/to/video.mp4 -f srt -l zh
+
+# 字幕默认用 auto 粒度：OpenRouter 用段级时间，Groq/local 优先用词级时间
+uv run python scripts/transcribe.py /path/to/video.mp4 -f srt
 
 # 使用提示词提升专业术语识别
 uv run python scripts/transcribe.py /path/to/video.mp4 --prompt "Kubernetes, Docker, DevOps"
@@ -87,8 +128,8 @@ uv run python scripts/transcribe.py /path/to/video.mp4 --prompt "Kubernetes, Doc
 # 输入文件
 /Users/me/Videos/lecture.mp4
 
-# 默认输出（Markdown）
-/Users/me/Videos/lecture_transcript.md
+# 默认输出（TXT 连续正文）
+/Users/me/Videos/lecture_transcript.txt
 
 # 指定 SRT 输出位置
 uv run python scripts/transcribe.py /Users/me/Videos/lecture.mp4 \
@@ -109,7 +150,7 @@ uv run python scripts/transcribe.py /Users/me/Videos/lecture.mp4 \
 ```
 用户：请帮我转录这个视频文件 /Users/me/lecture.mp4
 
-Claude：转录完成，输出文件：/Users/me/lecture_transcript.md
+Claude：转录完成，输出文件：/Users/me/lecture_transcript.txt
 
 用户：请将刚才的视频转成 SRT 字幕，语言是中文
 
@@ -120,9 +161,10 @@ Claude：字幕文件已生成：/Users/me/lecture_transcript.srt
 
 - **云端模式**
   - “请用 `audio-transcribe` 把这个视频转成文字”
-  - “请把 `/path/to/file.mp4` 转录成 Markdown”
+  - “请把 `/path/to/file.mp4` 转录成连续纯文本”
   - “请生成这个音频的中文 SRT 字幕”
   - “请使用 Groq / 云端方式转录这个文件”
+  - “请用 OpenRouter 的 Gemini 2.5 Flash 转录这个音频”
 
 - **离线模式**
   - “请离线转录这个视频，不要调用云端 API”
@@ -132,6 +174,7 @@ Claude：字幕文件已生成：/Users/me/lecture_transcript.srt
 为了避免歧义，建议直接写清楚：
 
 - **云端版**：`使用 Groq / 云端 / online`
+- **OpenRouter 版**：`使用 OpenRouter / Gemini / gemini-2.5-flash`
 - **离线版**：`使用本地 / 离线 / faster-whisper / local`
 
 ### OpenAI Codex
@@ -155,7 +198,8 @@ Codex：我将执行转录命令...
 
 - 项目目录在哪里
 - 执行命令用 `uv run`
-- 云端模式需要 `GROQ_API_KEY`
+- Groq 云端模式需要 `GROQ_API_KEY`
+- OpenRouter 云端模式需要 `OPENROUTER_API_KEY`
 - 离线模式使用 `--backend local`
 
 这样 Codex 更容易生成正确命令。
@@ -289,20 +333,21 @@ uv run --extra local python scripts/transcribe.py /path/to/test.mp3 \
 ```
 usage: transcribe.py [-h] [-o OUTPUT] [-f {md,txt,srt,vtt}]
                      [-l LANGUAGE] [-g {segment,word}] [-m MODEL] [-p PROMPT]
-                     [--chunk-minutes CHUNK_MINUTES] [-b {groq,local}]
+                     [--chunk-minutes CHUNK_MINUTES]
+                     [-b {groq,openrouter,local}]
                      [--compute-type COMPUTE_TYPE]
                      input
 
 参数：
   input                 输入的音视频文件路径
   -o, --output         输出文件路径（默认：输入文件目录 + _transcript.格式）
-  -f, --format         输出格式：md（默认）、txt、srt、vtt
+  -f, --format         输出格式：txt（默认）、md、srt、vtt
   -l, --language       语言代码：zh、en、ja 等（默认：自动检测）
-  -g, --granularity    时间戳粒度：segment（段落，默认）、word（单词级）
-  -m, --model          模型名称（云端默认：whisper-large-v3；离线常用：large-v3、base、small、medium）
+  -g, --granularity    时间戳粒度：auto（默认）、segment（段落）、word（单词级）
+  -m, --model          模型名称（groq 默认：whisper-large-v3；openrouter 默认：google/gemini-2.5-flash；离线常用：large-v3、base、small、medium）
   -p, --prompt         提示词，帮助识别专业术语、人名等
   --chunk-minutes      大文件分片时长，默认 10 分钟（仅云端模式）
-  -b, --backend        后端：groq（云端，默认）、local（离线 GPU）
+  -b, --backend        后端：groq（云端默认）、openrouter（Gemini ASR）、local（离线 GPU）
   --compute-type       本地精度：float16（默认）、float32、int8_float16
 ```
 

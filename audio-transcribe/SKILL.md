@@ -1,9 +1,11 @@
 ---
 name: audio-transcribe
 description: >
-  Transcribe video or audio files to timestamped text. Two backends:
-  Groq Whisper API (online, fast, requires API key) and faster-whisper
-  (local/offline, GPU with CUDA 12.x, no API key needed). Supports all
+  Transcribe video or audio files to timestamped text. Three backends:
+  Groq Whisper API (online, fast, requires API key), OpenRouter
+  google/gemini-2.5-flash (online multimodal ASR, requires API key, segment
+  timestamps only), and faster-whisper (local/offline, GPU with CUDA 12.x,
+  no API key needed). Supports all
   common video formats (mp4, mkv, avi, mov, etc.) and audio formats
   (mp3, wav, flac, m4a, etc.). Features: auto audio extraction from video
   via ffmpeg, large file chunking, multiple output formats (Markdown, TXT,
@@ -17,7 +19,7 @@ description: >
 
 # Audio Transcribe
 
-Transcribe video/audio files to timestamped text. Supports online (Groq API) and offline (faster-whisper GPU) backends.
+Transcribe video/audio files to timestamped text. Supports Groq API, OpenRouter Gemini ASR, and offline faster-whisper GPU.
 
 ## Setup
 
@@ -25,28 +27,35 @@ Transcribe video/audio files to timestamped text. Supports online (Groq API) and
 2. Script path: `${SKILL_DIR}/scripts/transcribe.py`
 3. ffmpeg: auto-detected globally; falls back to `static-ffmpeg` Python package
 4. Backend prerequisites:
-   - **Groq (default)**: Require environment variable `GROQ_API_KEY` (obtain from https://console.groq.com/keys). If not set, prompt the user to set it before running.
+   - **Shared config**: Optional `AUDIO_TRANSCRIBE_DEFAULT_BACKEND`, `AUDIO_TRANSCRIBE_DEFAULT_MODEL`, and `AUDIO_TRANSCRIBE_API_KEY` in `~/.utility-skills/.env`
+   - **Groq (default)**: Require `GROQ_API_KEY` in `~/.utility-skills/.env` (obtain from https://console.groq.com/keys). Optional: `GROQ_BASE_URL`.
+   - **OpenRouter**: Require `OPENROUTER_API_KEY` in `~/.utility-skills/.env` (obtain from https://openrouter.ai/settings/keys). Optional: `OPENROUTER_BASE_URL`, `OPENROUTER_HTTP_REFERER`, `OPENROUTER_APP_TITLE`.
    - **Local (GPU)**: Requires NVIDIA GPU with CUDA 12.x. Install optional dependency first: `uv sync --project ${SKILL_DIR} --extra local` (includes faster-whisper, nvidia-cublas-cu12, nvidia-cudnn-cu12). No API key needed.
 
 ## Workflow
 
 1. Determine the input file type and desired output format
 2. Choose the backend:
-   - **Online (default)** → `--backend groq` (requires `GROQ_API_KEY`)
+   - **Online (default)** → `--backend groq` (defaults can come from `AUDIO_TRANSCRIBE_DEFAULT_BACKEND` / `AUDIO_TRANSCRIBE_DEFAULT_MODEL`; requires `GROQ_API_KEY` or `AUDIO_TRANSCRIBE_API_KEY`)
+   - **Alternative online ASR** → `--backend openrouter` (defaults to `google/gemini-2.5-flash`; requires `OPENROUTER_API_KEY` or `AUDIO_TRANSCRIBE_API_KEY`; segment timestamps only)
    - **Offline / no API key** → `--backend local` (requires NVIDIA GPU + CUDA 12.x)
 3. Choose the appropriate command options:
-   - **Subtitles needed?** → use `--format srt` or `--format vtt`
+   - **Subtitles needed?** → use `--format srt` or `--format vtt`; default `--granularity auto` uses segment timings for OpenRouter and word timings for Groq Whisper / local faster-whisper, then merges them into readable subtitle lines
    - **Non-English audio?** → add `--language zh` (or `en`, `ja`, etc.)
    - **Domain-specific terms?** → add `--prompt "术语1, 术语2"` to improve accuracy
-   - **Fast online transcription?** → add `--model whisper-large-v3-turbo`
+   - **Fast Groq transcription?** → add `--model whisper-large-v3-turbo`
+   - **Gemini ASR?** → add `--backend openrouter` and optionally `--model google/gemini-2.5-flash`
    - **Local precision control?** → add `--compute-type float16` (default) or `int8_float16`
 4. Run the script and deliver the output file to the user
 
 ## Usage
 
 ```bash
-# Online: basic transcription (Groq API, outputs Markdown)
+# Online: basic transcription (Groq API, outputs plain TXT by default)
 uv run --project ${SKILL_DIR} python ${SKILL_DIR}/scripts/transcribe.py /path/to/file.mp4
+
+# Online: OpenRouter Gemini 2.5 Flash transcription
+uv run --project ${SKILL_DIR} python ${SKILL_DIR}/scripts/transcribe.py /path/to/file.mp4 -b openrouter
 
 # Online: SRT subtitles in Chinese
 uv run --project ${SKILL_DIR} python ${SKILL_DIR}/scripts/transcribe.py /path/to/file.mp4 -f srt -l zh
@@ -65,10 +74,14 @@ Run `uv run --project ${SKILL_DIR} python ${SKILL_DIR}/scripts/transcribe.py --h
 
 ## Key Details
 
-- **Groq backend**: files over 25MB are auto-chunked (configurable via `--chunk-minutes`, default 10)
+- **Groq backend**: default cloud backend and model are `groq` + `whisper-large-v3`; files over 25MB are auto-chunked (configurable via `--chunk-minutes`, default 10)
+- **OpenRouter backend**: default model is `google/gemini-2.5-flash`; subtitle timing stays segment-based because word-level timestamps are not available
 - **Local backend**: requires NVIDIA GPU + CUDA 12.x; no file size limit; includes VAD filtering automatically
 - CUDA libraries (cuBLAS, cuDNN 9) are auto-installed via `--extra local`; `LD_LIBRARY_PATH` is set automatically at runtime
+- Configuration is loaded from `~/.utility-skills/.env`
+- Provider-specific API keys take precedence over the generic `AUDIO_TRANSCRIBE_API_KEY`
+- Default `--granularity auto` keeps Markdown segment-based, makes TXT a continuous plain-text transcript, and for subtitles prefers word timings on Groq Whisper and local faster-whisper when available
 - Output defaults to same directory as input with appropriate extension
 - All video formats auto-extract audio; all audio formats accepted directly
-- The `--prompt` option provides context hints to Whisper (proper nouns, technical terms) — it does NOT instruct the model, just guides recognition accuracy
+- The `--prompt` option provides recognition hints (proper nouns, technical terms) across providers
 - Local model is downloaded automatically on first use (cached in `~/.cache/huggingface/`)

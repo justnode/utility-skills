@@ -3,13 +3,14 @@
 Audio/Video Transcription Script.
 
 Transcribes video or audio files to timestamped text.
-- Backend: Groq Whisper API (online) or faster-whisper (local/offline).
+- Backends: Groq Whisper API, OpenRouter Gemini 2.5 Flash, or faster-whisper.
 - Automatically extracts audio from video files using ffmpeg.
 - Supports large file chunking with configurable chunk duration.
 - Outputs in Markdown, TXT, SRT, or VTT format with timestamps.
 """
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -20,6 +21,9 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 # groq and faster_whisper are imported lazily based on --backend
 
@@ -37,21 +41,254 @@ AUDIO_EXTENSIONS = {
     ".aac", ".wma", ".opus", ".webm",
 }
 
-# Groq free-tier file size limit (bytes)
-MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024  # 25 MB
+# Prepared-audio chunk threshold for cloud backends (bytes)
+CLOUD_CHUNK_THRESHOLD_BYTES = 25 * 1024 * 1024  # 25 MB
 
 DEFAULT_CHUNK_MINUTES = 10
-DEFAULT_MODEL = "whisper-large-v3"
-DEFAULT_FORMAT = "md"
-DEFAULT_GRANULARITY = "segment"
+DEFAULT_FORMAT = "txt"
+DEFAULT_GRANULARITY = "auto"
 
-# API retry settings (groq backend)
+# API retry settings (cloud backends)
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
 
 # Backend defaults
 DEFAULT_BACKEND = "groq"
 DEFAULT_COMPUTE_TYPE = "float16"
+GLOBAL_ENV_PATH = Path.home() / ".utility-skills" / ".env"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
+DEFAULT_BACKEND_ENV_VAR = "AUDIO_TRANSCRIBE_DEFAULT_BACKEND"
+DEFAULT_MODEL_ENV_VAR = "AUDIO_TRANSCRIBE_DEFAULT_MODEL"
+DEFAULT_API_KEY_ENV_VAR = "AUDIO_TRANSCRIBE_API_KEY"
+
+BACKEND_DEFAULT_MODELS = {
+    "groq": "whisper-large-v3",
+    "openrouter": "google/gemini-2.5-flash",
+    "local": "whisper-large-v3",
+}
+
+
+def load_env_file(env_path: Path) -> None:
+    """Load simple KEY=VALUE pairs from a .env file into os.environ.
+
+    Existing environment variables win over values from the file so callers can
+    still override configuration per shell/session.
+    """
+    if not env_path.exists():
+        return
+
+    try:
+        env_lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        print(f"Warning: failed to read env file {env_path}: {exc}", file=sys.stderr)
+        return
+
+    for raw_line in env_lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if not key:
+            continue
+
+        if (
+            len(value) >= 2
+            and value[0] == value[-1]
+            and value[0] in {"'", '"'}
+        ):
+            value = value[1:-1]
+
+        os.environ.setdefault(key, value)
+
+
+TranscribeFn = Callable[[str], dict]
+
+SUBTITLE_MAX_CHARS = 22
+SUBTITLE_MAX_DURATION_SECONDS = 4.5
+SUBTITLE_MAX_GAP_SECONDS = 0.6
+SENTENCE_BREAK_PUNCTUATION = set("。！？!?；;")
+SOFT_BREAK_PUNCTUATION = set("，、,")
+
+
+def resolve_default_backend() -> str:
+    """Resolve the default backend from environment configuration."""
+    configured_backend = os.environ.get(DEFAULT_BACKEND_ENV_VAR, "").strip()
+    if not configured_backend:
+        return DEFAULT_BACKEND
+
+    if configured_backend not in BACKEND_DEFAULT_MODELS:
+        supported = ", ".join(BACKEND_DEFAULT_MODELS)
+        print(
+            f"Warning: {DEFAULT_BACKEND_ENV_VAR}={configured_backend!r} is not supported. "
+            f"Expected one of: {supported}. Falling back to {DEFAULT_BACKEND}.",
+            file=sys.stderr,
+        )
+        return DEFAULT_BACKEND
+
+    return configured_backend
+
+
+def resolve_default_model() -> str | None:
+    """Resolve the optional global default model from environment configuration."""
+    configured_model = os.environ.get(DEFAULT_MODEL_ENV_VAR, "").strip()
+    if configured_model:
+        return configured_model
+    return None
+
+
+def resolve_api_key(*env_var_names: str) -> str | None:
+    """Return the first configured API key from the provided env vars."""
+    for env_var_name in env_var_names:
+        value = os.environ.get(env_var_name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def is_cjk_character(char: str) -> bool:
+    """Return True when a character belongs to a common CJK Unicode block."""
+    if not char:
+        return False
+    codepoint = ord(char)
+    return (
+        0x4E00 <= codepoint <= 0x9FFF
+        or 0x3400 <= codepoint <= 0x4DBF
+        or 0x3040 <= codepoint <= 0x30FF
+        or 0xAC00 <= codepoint <= 0xD7AF
+    )
+
+
+def merge_word_token(existing_text: str, token: str) -> str:
+    """Append a word token using spacing rules that work for CJK and Latin text."""
+    token = token.strip()
+    if not token:
+        return existing_text
+    if not existing_text:
+        return token
+
+    if token[0] in SENTENCE_BREAK_PUNCTUATION or token[0] in SOFT_BREAK_PUNCTUATION:
+        return existing_text + token
+
+    if is_cjk_character(existing_text[-1]) or is_cjk_character(token[0]):
+        return existing_text + token
+
+    return existing_text + " " + token
+
+
+def resolve_effective_granularity(backend: str, model: str, granularity: str, output_format: str) -> str:
+    """Resolve the timestamp source used for a given output."""
+    if granularity != "auto":
+        return granularity
+
+    if output_format in {"srt", "vtt"}:
+        if backend == "openrouter":
+            return "segment"
+        if backend == "local":
+            return "word"
+        if backend == "groq" and "whisper-large-v3" in model:
+            return "word"
+
+    return "segment"
+
+
+def build_subtitle_segments_from_words(words: list[dict]) -> list[dict]:
+    """Group word-level timestamps into readable subtitle segments."""
+    subtitle_segments: list[dict] = []
+    current_text = ""
+    current_start: float | None = None
+    current_end: float | None = None
+    previous_end: float | None = None
+
+    def flush_current() -> None:
+        nonlocal current_text, current_start, current_end
+        if current_text and current_start is not None and current_end is not None:
+            subtitle_segments.append({
+                "start": current_start,
+                "end": current_end,
+                "text": current_text.strip(),
+            })
+        current_text = ""
+        current_start = None
+        current_end = None
+
+    for word in words:
+        token = str(word.get("word", "") or "").strip()
+        start = float(word.get("start", 0) or 0)
+        end = float(word.get("end", 0) or 0)
+        if not token:
+            continue
+
+        if (
+            current_text
+            and previous_end is not None
+            and start - previous_end >= SUBTITLE_MAX_GAP_SECONDS
+        ):
+            flush_current()
+
+        if current_start is None:
+            current_start = start
+
+        candidate_text = merge_word_token(current_text, token)
+        current_text = candidate_text
+        current_end = end
+        previous_end = end
+
+        duration = (current_end - current_start) if current_start is not None else 0
+        last_char = current_text[-1] if current_text else ""
+
+        should_flush = False
+        if len(current_text) >= SUBTITLE_MAX_CHARS:
+            should_flush = True
+        elif duration >= SUBTITLE_MAX_DURATION_SECONDS:
+            should_flush = True
+        elif last_char in SENTENCE_BREAK_PUNCTUATION:
+            should_flush = True
+        elif last_char in SOFT_BREAK_PUNCTUATION and len(current_text) >= 10:
+            should_flush = True
+
+        if should_flush:
+            flush_current()
+
+    flush_current()
+    return subtitle_segments
+
+
+def build_plain_text(transcript_data: dict) -> str:
+    """Build a continuous plain-text transcript without timestamps."""
+    segments = transcript_data.get("segments", []) or []
+    if segments:
+        text = ""
+        for segment in segments:
+            piece = str(segment.get("text", "") or "").strip()
+            if not piece:
+                continue
+            text = merge_word_token(text, piece)
+        if text:
+            return text.strip()
+
+    return str(transcript_data.get("text", "") or "").strip()
+
+
+def build_output_segments(data: dict, granularity: str, output_format: str) -> list[dict]:
+    """Build output segments using the timestamp granularity requested upstream."""
+    if output_format in {"srt", "vtt"} and granularity == "word":
+        words = data.get("words", []) or []
+        if words:
+            return build_subtitle_segments_from_words(words)
+        if data.get("segments"):
+            return _extract_segments(data, "segment", offset=0.0)
+
+    return _extract_segments(data, granularity, offset=0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +430,205 @@ def transcribe_groq(
     raise last_error
 
 
+def _strip_json_fences(content: str) -> str:
+    """Remove optional markdown code fences around JSON responses."""
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def _extract_openrouter_message_content(response_data: dict) -> str:
+    """Extract the assistant message content from an OpenRouter response."""
+    choices = response_data.get("choices") or []
+    if not choices:
+        raise ValueError("OpenRouter response did not include any choices")
+
+    message = choices[0].get("message") or {}
+    content = message.get("content", "")
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif "text" in item:
+                    parts.append(str(item.get("text", "")))
+        return "\n".join(part for part in parts if part)
+
+    raise TypeError(f"Unexpected OpenRouter content type: {type(content)}")
+
+
+def _normalize_transcript_result(result: dict) -> dict:
+    """Normalize a provider response into the shared transcript structure."""
+    normalized = {
+        "text": str(result.get("text", "") or "").strip(),
+        "language": result.get("language"),
+        "segments": [],
+        "words": [],
+    }
+
+    for segment in result.get("segments", []) or []:
+        normalized["segments"].append({
+            "start": float(segment.get("start", 0) or 0),
+            "end": float(segment.get("end", 0) or 0),
+            "text": str(segment.get("text", "") or "").strip(),
+        })
+
+    for word in result.get("words", []) or []:
+        normalized["words"].append({
+            "start": float(word.get("start", 0) or 0),
+            "end": float(word.get("end", 0) or 0),
+            "word": str(word.get("word", "") or "").strip(),
+        })
+
+    return normalized
+
+
+def transcribe_openrouter(
+    api_key: str,
+    base_url: str,
+    audio_path: str,
+    model: str,
+    language: str | None,
+    prompt: str | None = None,
+    referer: str | None = None,
+    title: str | None = None,
+) -> dict:
+    """Transcribe a single audio file via OpenRouter chat completions."""
+    audio_bytes = Path(audio_path).read_bytes()
+    audio_b64 = base64.b64encode(audio_bytes).decode("ascii")
+
+    instruction_lines = [
+        "Transcribe this audio clip faithfully.",
+        "Return JSON only.",
+        "Provide top-level keys: text, language, segments, words.",
+        "Each segment must include start, end, and text in seconds relative to this clip.",
+        "Use best-effort segment timestamps and preserve the spoken wording.",
+        "Leave words as an empty array.",
+        "Do not summarize or translate unless the audio itself does so.",
+    ]
+    if language:
+        instruction_lines.append(
+            f"The expected spoken language is {language}; keep that language in the transcript when possible."
+        )
+    if prompt:
+        instruction_lines.append(
+            f"Domain-specific hint for names/terms: {prompt}"
+        )
+
+    payload = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "transcript_result",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "text": {"type": "string"},
+                        "language": {"type": ["string", "null"]},
+                        "segments": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "start": {"type": "number"},
+                                    "end": {"type": "number"},
+                                    "text": {"type": "string"},
+                                },
+                                "required": ["start", "end", "text"],
+                            },
+                        },
+                        "words": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "start": {"type": "number"},
+                                    "end": {"type": "number"},
+                                    "word": {"type": "string"},
+                                },
+                                "required": ["start", "end", "word"],
+                            },
+                        },
+                    },
+                    "required": ["text", "language", "segments", "words"],
+                },
+            },
+        },
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "\n".join(instruction_lines),
+                    },
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": audio_b64,
+                            "format": "flac",
+                        },
+                    },
+                ],
+            }
+        ],
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if referer:
+        headers["HTTP-Referer"] = referer
+    if title:
+        headers["X-Title"] = title
+
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            req = urllib_request.Request(
+                base_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib_request.urlopen(req) as response:
+                response_data = json.loads(response.read().decode("utf-8"))
+
+            content = _extract_openrouter_message_content(response_data)
+            parsed = json.loads(_strip_json_fences(content))
+            return _normalize_transcript_result(parsed)
+        except (urllib_error.URLError, urllib_error.HTTPError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            last_error = exc
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY_SECONDS * attempt
+                print(f"  ⚠ API error (attempt {attempt}/{MAX_RETRIES}): {exc}")
+                print(f"    Retrying in {delay}s …")
+                time.sleep(delay)
+            else:
+                break
+
+    print(f"  ✗ API failed after {MAX_RETRIES} attempts: {last_error}", file=sys.stderr)
+    raise last_error
+
+
 def transcribe_local(
     fw_model,
     audio_path: str,
@@ -243,6 +679,54 @@ def transcribe_local(
     return result
 
 
+def resolve_model(
+    backend: str,
+    requested_model: str | None,
+    configured_default_model: str | None = None,
+) -> str:
+    """Resolve the effective model for a backend."""
+    if requested_model:
+        return requested_model
+    if configured_default_model:
+        return configured_default_model
+    return BACKEND_DEFAULT_MODELS[backend]
+
+
+def offset_transcript_data(data: dict, offset: float) -> dict:
+    """Offset transcript timestamps by a chunk start time."""
+    normalized = _normalize_transcript_result(data)
+    for segment in normalized["segments"]:
+        segment["start"] += offset
+        segment["end"] += offset
+    for word in normalized["words"]:
+        word["start"] += offset
+        word["end"] += offset
+    return normalized
+
+
+def merge_transcript_data(results: list[dict]) -> dict:
+    """Merge multiple chunk transcript results into one transcript structure."""
+    merged = {
+        "text": "",
+        "language": None,
+        "segments": [],
+        "words": [],
+    }
+
+    text_parts: list[str] = []
+    for result in results:
+        normalized = _normalize_transcript_result(result)
+        if not merged["language"] and normalized.get("language"):
+            merged["language"] = normalized["language"]
+        if normalized["text"]:
+            text_parts.append(normalized["text"])
+        merged["segments"].extend(normalized["segments"])
+        merged["words"].extend(normalized["words"])
+
+    merged["text"] = " ".join(part for part in text_parts if part).strip()
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Chunking logic
 # ---------------------------------------------------------------------------
@@ -251,21 +735,20 @@ def transcribe_local(
 def process_file(
     input_path: str,
     transcribe_fn,
-    granularity: str,
     chunk_minutes: int,
     ffmpeg_path: str,
     ffprobe_path: str,
     need_chunking: bool = True,
-) -> list[dict]:
+) -> dict:
     """
     Process an input file: extract audio if needed, chunk if large, transcribe.
 
     Args:
-        transcribe_fn: Callable(audio_path) -> dict  (Groq-style verbose_json dict)
-        need_chunking: If True, chunk files exceeding 25MB (required for Groq).
-                       If False, process as a single file (local backend handles any size).
+        transcribe_fn: Callable(audio_path) -> dict  (shared transcript dict)
+        need_chunking: If True, chunk prepared audio files exceeding the cloud
+                       threshold. If False, process as a single file.
 
-    Returns a list of segment dicts with keys: start, end, text.
+    Returns a transcript dict with keys: text, language, segments, words.
     """
     input_ext = Path(input_path).suffix.lower()
     is_video = input_ext in VIDEO_EXTENSIONS
@@ -285,19 +768,22 @@ def process_file(
         file_size = os.path.getsize(prepared_audio)
 
         # Step 2: Decide whether to chunk
-        if not need_chunking or file_size <= MAX_FILE_SIZE_BYTES:
+        if not need_chunking or file_size <= CLOUD_CHUNK_THRESHOLD_BYTES:
             print(f"  File size: {file_size / 1024 / 1024:.1f} MB")
             print(f"  Transcribing …")
             result = transcribe_fn(prepared_audio)
-            return _extract_segments(result, granularity, offset=0.0)
+            return _normalize_transcript_result(result)
         else:
-            print(f"  File size: {file_size / 1024 / 1024:.1f} MB (exceeds {MAX_FILE_SIZE_BYTES / 1024 / 1024:.0f} MB limit)")
+            print(
+                f"  File size: {file_size / 1024 / 1024:.1f} MB "
+                f"(exceeds {CLOUD_CHUNK_THRESHOLD_BYTES / 1024 / 1024:.0f} MB cloud chunk threshold)"
+            )
             duration = get_audio_duration(prepared_audio, ffprobe_path)
             chunk_duration = chunk_minutes * 60
             num_chunks = math.ceil(duration / chunk_duration)
             print(f"  Duration: {_fmt_seconds(duration)} | Splitting into {num_chunks} chunk(s) …")
 
-            all_segments: list[dict] = []
+            all_results: list[dict] = []
 
             for i in range(num_chunks):
                 start = i * chunk_duration
@@ -311,14 +797,13 @@ def process_file(
                 extract_audio(prepared_audio, chunk_path, ffmpeg_path, start_seconds=start, duration_seconds=actual_duration)
 
                 result = transcribe_fn(chunk_path)
-                segments = _extract_segments(result, granularity, offset=start)
-                all_segments.extend(segments)
+                all_results.append(offset_transcript_data(result, offset=start))
 
-            return all_segments
+            return merge_transcript_data(all_results)
 
 
 def _extract_segments(data: dict, granularity: str, offset: float) -> list[dict]:
-    """Extract timestamped segments from the Groq API response."""
+    """Extract timestamped segments from the shared transcript structure."""
     segments: list[dict] = []
 
     if granularity == "word":
@@ -405,15 +890,9 @@ def format_markdown(
     return "\n".join(lines)
 
 
-def format_txt(segments: list[dict]) -> str:
-    """Format transcription segments as plain text with timestamps."""
-    lines = []
-    for seg in segments:
-        ts = _fmt_seconds(seg["start"])
-        text = seg["text"]
-        if text:
-            lines.append(f"[{ts}] {text}")
-    return "\n".join(lines)
+def format_txt(transcript_data: dict) -> str:
+    """Format transcription as continuous plain text without timestamps."""
+    return build_plain_text(transcript_data)
 
 
 def _fmt_srt_time(seconds: float) -> str:
@@ -475,10 +954,28 @@ def format_vtt(segments: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(
+    default_backend: str,
+    configured_default_model: str | None,
+) -> argparse.ArgumentParser:
+    if configured_default_model:
+        model_help = (
+            "Model name. Defaults to "
+            f"{DEFAULT_MODEL_ENV_VAR}={configured_default_model}; "
+            "otherwise uses the selected backend default."
+        )
+    else:
+        model_help = (
+            "Model name. Defaults to the selected backend default "
+            f"(groq: {BACKEND_DEFAULT_MODELS['groq']}, "
+            f"openrouter: {BACKEND_DEFAULT_MODELS['openrouter']}, "
+            f"local: {BACKEND_DEFAULT_MODELS['local']})."
+        )
+
     parser = argparse.ArgumentParser(
         description="Transcribe video/audio files to timestamped text. "
-                    "Supports Groq Whisper API (online) and faster-whisper (local/offline).",
+                    "Supports Groq Whisper API, OpenRouter Gemini 2.5 Flash, "
+                    "and faster-whisper (local/offline).",
     )
     parser.add_argument(
         "input",
@@ -501,14 +998,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-g", "--granularity",
-        choices=["segment", "word"],
+        choices=["auto", "segment", "word"],
         default=DEFAULT_GRANULARITY,
-        help=f"Timestamp granularity (default: {DEFAULT_GRANULARITY})",
+        help=(
+            "Timestamp granularity. 'auto' uses segment timestamps by default, "
+            "and for subtitles prefers word timings on Groq whisper-large-v3 and local faster-whisper."
+        ),
     )
     parser.add_argument(
         "-m", "--model",
-        default=DEFAULT_MODEL,
-        help=f"Whisper model name (default: {DEFAULT_MODEL})",
+        default=None,
+        help=model_help,
     )
     parser.add_argument(
         "-p", "--prompt",
@@ -523,9 +1023,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "-b", "--backend",
-        choices=["groq", "local"],
-        default=DEFAULT_BACKEND,
-        help=f"Transcription backend (default: {DEFAULT_BACKEND})",
+        choices=["groq", "openrouter", "local"],
+        default=default_backend,
+        help=f"Transcription backend (default: {default_backend})",
     )
     parser.add_argument(
         "--compute-type",
@@ -551,9 +1051,130 @@ def _setup_cuda_lib_path() -> None:
         pass  # Libraries might be installed system-wide
 
 
+def setup_groq_backend(
+    model: str,
+    language: str | None,
+    granularity: str,
+    prompt: str | None,
+) -> tuple[TranscribeFn, bool, str]:
+    """Create a Groq transcription backend."""
+    from groq import Groq
+
+    api_key = resolve_api_key("GROQ_API_KEY", DEFAULT_API_KEY_ENV_VAR)
+    if not api_key or api_key == "your_groq_api_key_here":
+        print(
+            "Error: GROQ_API_KEY environment variable is not set.\n"
+            f"Please add it to {GLOBAL_ENV_PATH}, for example:\n"
+            f"{DEFAULT_BACKEND_ENV_VAR}=groq\n"
+            f"{DEFAULT_MODEL_ENV_VAR}=whisper-large-v3\n"
+            "GROQ_API_KEY=gsk_...\n"
+            f"{DEFAULT_API_KEY_ENV_VAR}=gsk_...  # optional generic fallback\n"
+            "Get a key from: https://console.groq.com/keys",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    client_kwargs = {"api_key": api_key}
+    groq_base_url = os.environ.get("GROQ_BASE_URL", "").strip()
+    if groq_base_url:
+        client_kwargs["base_url"] = groq_base_url
+
+    client = Groq(**client_kwargs)
+
+    def transcribe_fn(audio_path: str) -> dict:
+        return transcribe_groq(client, audio_path, model, language, granularity, prompt)
+
+    return transcribe_fn, True, f"groq ({model})"
+
+
+def setup_openrouter_backend(
+    model: str,
+    language: str | None,
+    granularity: str,
+    prompt: str | None,
+) -> tuple[TranscribeFn, bool, str]:
+    """Create an OpenRouter transcription backend."""
+    api_key = resolve_api_key("OPENROUTER_API_KEY", DEFAULT_API_KEY_ENV_VAR)
+    if not api_key:
+        print(
+            "Error: OPENROUTER_API_KEY environment variable is not set.\n"
+            f"Please add it to {GLOBAL_ENV_PATH}, for example:\n"
+            f"{DEFAULT_BACKEND_ENV_VAR}=openrouter\n"
+            f"{DEFAULT_MODEL_ENV_VAR}=google/gemini-2.5-flash\n"
+            "OPENROUTER_API_KEY=sk-or-...\n"
+            f"{DEFAULT_API_KEY_ENV_VAR}=sk-or-...  # optional generic fallback\n"
+            "Get a key from: https://openrouter.ai/settings/keys",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if granularity == "word":
+        print(
+            "Error: --granularity word is not supported for the openrouter backend.\n"
+            "Use --granularity segment for OpenRouter Gemini ASR.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    base_url = os.environ.get("OPENROUTER_BASE_URL", "").strip() or DEFAULT_OPENROUTER_BASE_URL
+    referer = os.environ.get("OPENROUTER_HTTP_REFERER", "").strip() or None
+    title = os.environ.get("OPENROUTER_APP_TITLE", "").strip() or None
+
+    def transcribe_fn(audio_path: str) -> dict:
+        return transcribe_openrouter(
+            api_key=api_key,
+            base_url=base_url,
+            audio_path=audio_path,
+            model=model,
+            language=language,
+            prompt=prompt,
+            referer=referer,
+            title=title,
+        )
+
+    return transcribe_fn, True, f"openrouter ({model})"
+
+
+def setup_local_backend(
+    model: str,
+    language: str | None,
+    granularity: str,
+    prompt: str | None,
+    compute_type: str,
+) -> tuple[TranscribeFn, bool, str]:
+    """Create a local faster-whisper backend."""
+    _setup_cuda_lib_path()
+
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print(
+            "Error: faster-whisper is not installed.\n"
+            "Install it: uv sync --project <SKILL_DIR> --extra local",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"  Loading model '{model}' on cuda ({compute_type}) …")
+    fw_model = WhisperModel(model, device="cuda", compute_type=compute_type)
+
+    def transcribe_fn(audio_path: str) -> dict:
+        return transcribe_local(fw_model, audio_path, language, granularity, prompt)
+
+    return transcribe_fn, False, f"local ({model}, cuda, {compute_type})"
+
+
 def main() -> None:
-    parser = build_parser()
+    # Load shared user-level configuration before validating backend credentials.
+    load_env_file(GLOBAL_ENV_PATH)
+    default_backend = resolve_default_backend()
+    configured_default_model = resolve_default_model()
+    parser = build_parser(default_backend, configured_default_model)
     args = parser.parse_args()
+    resolved_model = resolve_model(args.backend, args.model, configured_default_model)
+    effective_granularity = resolve_effective_granularity(
+        args.backend, resolved_model, args.granularity, args.format
+    )
 
     # Validate input file
     input_path = os.path.abspath(args.input)
@@ -589,48 +1210,17 @@ def main() -> None:
 
     # Initialize backend
     if args.backend == "groq":
-        from groq import Groq
-
-        api_key = os.environ.get("GROQ_API_KEY")
-        if not api_key or api_key == "your_groq_api_key_here":
-            print(
-                "Error: GROQ_API_KEY environment variable is not set.\n"
-                "Please set it: export GROQ_API_KEY=your_key_here\n"
-                "Get a key from: https://console.groq.com/keys",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        client = Groq(api_key=api_key)
-
-        def transcribe_fn(audio_path: str) -> dict:
-            return transcribe_groq(client, audio_path, args.model, args.language, args.granularity, args.prompt)
-
-        need_chunking = True
-        backend_display = f"groq ({args.model})"
-
-    else:  # local (GPU only, CUDA 12.x)
-        _setup_cuda_lib_path()
-
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            print(
-                "Error: faster-whisper is not installed.\n"
-                "Install it: uv sync --project <SKILL_DIR> --extra local",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        compute_type = args.compute_type
-        print(f"  Loading model '{args.model}' on cuda ({compute_type}) …")
-        fw_model = WhisperModel(args.model, device="cuda", compute_type=compute_type)
-
-        def transcribe_fn(audio_path: str) -> dict:
-            return transcribe_local(fw_model, audio_path, args.language, args.granularity, args.prompt)
-
-        need_chunking = False
-        backend_display = f"local ({args.model}, cuda, {compute_type})"
+        transcribe_fn, need_chunking, backend_display = setup_groq_backend(
+            resolved_model, args.language, effective_granularity, args.prompt
+        )
+    elif args.backend == "openrouter":
+        transcribe_fn, need_chunking, backend_display = setup_openrouter_backend(
+            resolved_model, args.language, effective_granularity, args.prompt
+        )
+    else:
+        transcribe_fn, need_chunking, backend_display = setup_local_backend(
+            resolved_model, args.language, effective_granularity, args.prompt, args.compute_type
+        )
 
     print(f"╔══════════════════════════════════════════════════╗")
     print(f"║          Audio Transcription Tool                ║")
@@ -640,6 +1230,8 @@ def main() -> None:
     print(f"  Backend:     {backend_display}")
     print(f"  Language:    {args.language or 'auto-detect'}")
     print(f"  Granularity: {args.granularity}")
+    if args.format in {"srt", "vtt"}:
+        print(f"  Subtitle TS: {effective_granularity}")
     print(f"  Format:      {args.format}")
     if args.prompt:
         print(f"  Prompt:      {args.prompt}")
@@ -647,15 +1239,16 @@ def main() -> None:
     print()
 
     # Process file
-    segments = process_file(
+    transcript_data = process_file(
         input_path=input_path,
         transcribe_fn=transcribe_fn,
-        granularity=args.granularity,
         chunk_minutes=args.chunk_minutes,
         ffmpeg_path=ffmpeg_path,
         ffprobe_path=ffprobe_path,
         need_chunking=need_chunking,
     )
+
+    segments = build_output_segments(transcript_data, effective_granularity, args.format)
 
     if not segments:
         print("Warning: No segments were transcribed.", file=sys.stderr)
@@ -663,8 +1256,8 @@ def main() -> None:
 
     # Format output
     formatters = {
-        "md": lambda: format_markdown(segments, input_path, args.model, args.language),
-        "txt": lambda: format_txt(segments),
+        "md": lambda: format_markdown(segments, input_path, resolved_model, args.language),
+        "txt": lambda: format_txt(transcript_data),
         "srt": lambda: format_srt(segments),
         "vtt": lambda: format_vtt(segments),
     }
