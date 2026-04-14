@@ -1,7 +1,7 @@
 [project]
 name = "image-generate"
 version = "1.0.0"
-description = "Generate images using Replicate API (google/nano-banana-2, bytedance/seedream-4.5)"
+description = "Generate images using Replicate API (google/nano-banana-2, bytedance/seedream-4.5, wan-video/wan-2.7-image-pro)"
 requires-python = ">=3.10"
 dependencies = [
     "replicate>=1.0.0",
